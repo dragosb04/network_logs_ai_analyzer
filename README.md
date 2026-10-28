@@ -6,7 +6,7 @@ It counts ERROR / WARNING / INFO entries, groups the most frequent errors and sh
 
 Everything runs on your machine: the log is never sent to an external service.
 
-> ⚠️ The AI output is a suggestion only. A human must verify it.
+> The AI generated output is a suggestion only. A human must verify it.
 
 ## Features
 
