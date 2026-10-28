@@ -5,17 +5,23 @@ import threading
 import webbrowser
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Literal
+from typing import Literal, TypedDict
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
+from langgraph.graph import StateGraph, START, END
 from ollama import ResponseError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:1.5b")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 HOST = "127.0.0.1"
 PORT = 8765
+
+MAX_AI_ATTEMPTS = 2
+CONTEXT_STEP = 3
+MAX_CONTEXT_CHARS = 3000
+
 
 def summarize(lines):
     level_counts = Counter()
@@ -46,27 +52,59 @@ def mask_sensitive(text):
     return text
 
 
-def build_ai_input(level_counts, error_messages):
+def extract_error_context(lines, context_size):
+    selected = set()
+    for index, line in enumerate(lines):
+        if "ERROR" in line:
+            start = max(0, index - context_size)
+            end = min(len(lines), index + context_size + 1)
+            for i in range(start, end):
+                selected.add(i)
+
+    context_lines = []
+    for i in sorted(selected):
+        context_lines.append(lines[i])
+
+    text = "\n".join(context_lines)
+    return text[:MAX_CONTEXT_CHARS]
+
+
+def build_ai_input(level_counts, error_messages, context_text):
     parts = [
         f"Errors: {level_counts['ERROR']}, Warnings: {level_counts['WARNING']}",
         "Most frequent errors:",
     ]
     for message, count in error_messages.most_common(10):
         parts.append(f"{count}x {message}")
+
+    if context_text:
+        parts.append("")
+        parts.append("Raw log lines around the errors:")
+        parts.append(context_text)
+
     return mask_sensitive("\n".join(parts))
 
 class LogAnalysis(BaseModel):
-    main_issue: str
-    confidence: Literal["High", "Medium", "Low"]
+    main_issue: str = Field(description="One sentence describing the main problem in the log. Never write the confidence here.")
+    evidence: list[str] = Field(description="Log facts that support the main issue, e.g. error messages and their counts.")
     possible_causes: list[str]
     investigation_steps: list[str]
+    confidence: Literal["High", "Medium", "Low"] = Field(description="How strongly the evidence points to the main issue.")
+
 
 prompt = ChatPromptTemplate.from_messages([
     ("system",
      "You are an expert system and network support engineer. Analyze this log summary carefully.\n"
-     "Identify the core root cause, evaluate confidence, list likely causes, and actionable checks."),
+     "Identify the core root cause, evaluate confidence, list likely causes, and actionable checks.\n"
+      "Confidence rules:\n"
+      "- High: most errors point to the same cause.\n"
+      "- Medium: one cause is likely, but other errors could be related.\n"
+      "- Low: errors point to several unrelated causes, or the information is too little.\n"
+      "If there are several unrelated problems, pick the one with the most errors as main_issue.\n"
+     "If raw log lines are included, use them to refine your answer."),
     ("human", "LOG SUMMARY:\n{summary}"),
 ])
+
 
 def build_chain(model_name):
     model = ChatOllama(
@@ -79,8 +117,10 @@ def build_chain(model_name):
     structured_model = model.with_structured_output(LogAnalysis)
     return prompt | structured_model
 
+
 def remove_numbering(text):
     return re.sub(r"^\s*\d+[.)]\s*", "", text)
+
 
 def ask_ai(summary_text, model_name, max_retries=2):
     chain = build_chain(model_name)
@@ -99,6 +139,67 @@ def ask_ai(summary_text, model_name, max_retries=2):
 
     return data
 
+class AgentState(TypedDict):
+    lines: list
+    level_counts: Counter
+    error_messages: Counter
+    model: str
+    context_size: int
+    ai_input: str
+    analysis: dict
+    attempts: int
+
+
+def build_input_node(state: AgentState) -> dict:
+    context_text = ""
+    if state["context_size"] > 0:
+        context_text = extract_error_context(state["lines"], state["context_size"])
+
+    ai_input = build_ai_input(state["level_counts"], state["error_messages"], context_text)
+    return {"ai_input": ai_input}
+
+
+def ask_ai_node(state: AgentState) -> dict:
+    analysis = ask_ai(state["ai_input"], state["model"])
+    attempts = state["attempts"] + 1
+    return {"analysis": analysis, "attempts": attempts}
+
+
+def more_context_node(state: AgentState) -> dict:
+    new_size = state["context_size"] + CONTEXT_STEP
+    return {"context_size": new_size}
+
+
+def decide_next_step(state: AgentState) -> str:
+    is_low = state["analysis"]["confidence"] == "Low"
+    can_retry = state["attempts"] < MAX_AI_ATTEMPTS
+    has_errors = state["level_counts"]["ERROR"] > 0
+
+    if is_low and can_retry and has_errors:
+        return "more_context"
+    return "done"
+
+
+def build_graph():
+    graph = StateGraph(AgentState)
+
+    graph.add_node("build_input", build_input_node)
+    graph.add_node("ask_ai", ask_ai_node)
+    graph.add_node("more_context", more_context_node)
+
+    graph.add_edge(START, "build_input")
+    graph.add_edge("build_input", "ask_ai")
+    graph.add_conditional_edges(
+        "ask_ai",
+        decide_next_step,
+        {"more_context": "more_context", "done": END},
+    )
+    graph.add_edge("more_context", "build_input")
+
+    return graph.compile()
+
+
+AGENT = build_graph()
 
 def analyze(text, model):
     lines = text.splitlines()
@@ -115,18 +216,34 @@ def analyze(text, model):
         "ai": None,
         "ai_error": None,
         "model": model,
+        "attempts": 0,
+        "context_lines": 0,
+    }
+
+    initial_state = {
+        "lines": lines,
+        "level_counts": level_counts,
+        "error_messages": error_messages,
+        "model": model,
+        "context_size": 0,
+        "ai_input": "",
+        "analysis": {},
+        "attempts": 0,
     }
 
     try:
-        result["ai"] = ask_ai(build_ai_input(level_counts, error_messages), model)
+        final_state = AGENT.invoke(initial_state)
+        result["ai"] = final_state["analysis"]
+        result["attempts"] = final_state["attempts"]
+        result["context_lines"] = final_state["context_size"]
     except ConnectionError:
-        result["ai_error"] = "Nu ma pot conecta la Ollama. Ruleaza? (incearca: ollama serve)"
+        result["ai_error"] = "Nu mă pot conecta la Ollama. Rulează? (încearcă: ollama serve)"
     except ResponseError:
-        result["ai_error"] = f"Ollama a returnat o eroare. Modelul e descarcat? (incearca: ollama pull {model})"
+        result["ai_error"] = f"Ollama a returnat o eroare. Modelul e descărcat? (încearcă: ollama pull {model})"
     except ValueError:
-        result["ai_error"] = "Modelul nu a returnat un raspuns JSON valid."
+        result["ai_error"] = "Modelul nu a returnat un răspuns JSON valid."
     except Exception as error:
-        result["ai_error"] = f"Analiza AI a esuat: {error}"
+        result["ai_error"] = f"Analiza AI a eșuat: {error}"
 
     return result
 
@@ -166,9 +283,9 @@ PAGE = """<!DOCTYPE html>
 
   .ai-box { display: flex; flex-direction: column; gap: 14px; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
-  .badge-high { background: #fee2e2; color: #b91c1c; }
-  .badge-medium { background: #fef3c7; color: #b45309; }
-  .badge-low { background: #e0f2fe; color: #0369a1; }
+  .badge-high { background: #dcfce7; color: #166534; }
+  .badge-medium { background: #fef3c7; color: #92400e; }
+  .badge-low { background: #e5e7eb; color: #374151; }
   .ai-section h3 { font-size: 13px; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
   .ai-list { margin: 0; padding-left: 20px; }
   .ai-list li { margin-bottom: 6px; }
@@ -182,12 +299,12 @@ PAGE = """<!DOCTYPE html>
 
   <div class="card">
     <div class="row">
-      <label id="drop" for="file">Trage un fisier .log aici sau click pentru a alege<input id="file" type="file" class="hidden"></label>
-      <span id="fname" class="muted">Niciun fisier ales.</span>
+      <label id="drop" for="file">Trage un fișier .log aici sau dă click pentru a alege<input id="file" type="file" class="hidden"></label>
+      <span id="fname" class="muted">Niciun fișier ales.</span>
     </div>
     <div class="row" style="margin-top:12px">
       <label>Model: <input id="model" type="text" readonly="readonly" value="__MODEL__"></label>
-      <button id="go" disabled>Analizeaza</button>
+      <button id="go" disabled>Analizează</button>
     </div>
   </div>
 
@@ -207,16 +324,16 @@ PAGE = """<!DOCTYPE html>
       <table id="errs"></table>
     </div>
 
-    <!-- [PARTEA 3]: Containerul HTML cu badge si zona de continut -->
     <div class="card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
         <h2 style="margin:0;">Sugestie AI <span class="muted" id="ai-model"></span></h2>
         <span id="ai-badge" class="badge hidden"></span>
       </div>
-      
+
       <div id="ai-content"></div>
-      
-      <p class="muted" style="margin-top:14px; margin-bottom:0;">Un om trebuie sa verifice aceasta sugestie.</p>
+
+      <p id="ai-agent" class="muted hidden" style="margin-top:14px; margin-bottom:0;"></p>
+      <p class="muted" style="margin-top:8px; margin-bottom:0;">Un om trebuie să verifice această sugestie.</p>
     </div>
   </div>
 </main>
@@ -236,15 +353,97 @@ $("file").addEventListener("change", e => setFile(e.target.files[0]));
 ["dragleave", "drop"].forEach(ev => $("drop").addEventListener(ev, e => { e.preventDefault(); $("drop").classList.remove("over"); }));
 $("drop").addEventListener("drop", e => setFile(e.dataTransfer.files[0]));
 
+function showMessage(text, className) {
+  const aiContent = $("ai-content");
+  aiContent.textContent = "";
+  const span = document.createElement("span");
+  if (className) span.className = className;
+  span.textContent = text;
+  aiContent.append(span);
+}
+
+function addListSection(box, title, items, listClass, numbered) {
+  const section = document.createElement("div");
+  section.className = "ai-section";
+
+  const h3 = document.createElement("h3");
+  h3.textContent = title;
+
+  const ul = document.createElement("ul");
+  ul.className = listClass;
+
+  items.forEach((item, idx) => {
+    const li = document.createElement("li");
+    if (numbered) {
+      const num = document.createElement("strong");
+      num.textContent = (idx + 1) + ". ";
+      li.append(num);
+    }
+    li.append(document.createTextNode(item));
+    ul.append(li);
+  });
+
+  section.append(h3, ul);
+  box.append(section);
+}
+
+function showBadge(confidence) {
+  const aiBadge = $("ai-badge");
+  const level = confidence.toLowerCase();
+
+  let badgeClass = "badge-medium";
+  if (level === "high") badgeClass = "badge-high";
+  if (level === "low") badgeClass = "badge-low";
+
+  aiBadge.textContent = "Certitudine: " + confidence;
+  aiBadge.className = "badge " + badgeClass;
+}
+
+function showAgentInfo(attempts, contextLines) {
+  const info = $("ai-agent");
+  if (attempts > 1) {
+    info.textContent = "Agentul a avut certitudine scăzută și a reîncercat cu ±" + contextLines
+      + " linii de context în jurul erorilor (" + attempts + " încercări).";
+  } else {
+    info.textContent = "Răspuns obținut din prima încercare.";
+  }
+  info.classList.remove("hidden");
+}
+
+function showAnalysis(aiData) {
+  const box = document.createElement("div");
+  box.className = "ai-box";
+
+  if (aiData.main_issue) {
+    const issue = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = "Problema identificată:";
+    const p = document.createElement("p");
+    p.style.margin = "4px 0 0";
+    p.textContent = aiData.main_issue;
+    issue.append(title, p);
+    box.append(issue);
+  }
+
+  if (aiData.possible_causes && aiData.possible_causes.length) {
+    addListSection(box, "Cauze posibile", aiData.possible_causes, "ai-list", false);
+  }
+
+  if (aiData.investigation_steps && aiData.investigation_steps.length) {
+    addListSection(box, "Ce ar trebui verificat", aiData.investigation_steps, "steps-list", true);
+  }
+
+  $("ai-content").textContent = "";
+  $("ai-content").append(box);
+}
+
 $("go").addEventListener("click", async () => {
   $("go").disabled = true;
   $("out").classList.remove("hidden");
-  
-  const aiContent = $("ai-content");
-  const aiBadge = $("ai-badge");
-  aiBadge.className = "badge hidden";
-  aiContent.innerHTML = "<em>Se asteapta raspunsul de la model...</em>";
+  $("ai-badge").className = "badge hidden";
+  $("ai-agent").classList.add("hidden");
   $("ai-model").textContent = "";
+  showMessage("Se așteaptă răspunsul de la model...", "muted");
 
   try {
     const res = await fetch("/analyze", {
@@ -253,82 +452,43 @@ $("go").addEventListener("click", async () => {
       body: JSON.stringify({ text: logText, model: $("model").value.trim() })
     });
     const d = await res.json();
+    if (!res.ok) {
+      throw new Error(d.error || "Serverul a returnat o eroare.");
+    }
+
     $("s-total").textContent = d.total;
     $("s-error").textContent = d.error;
     $("s-warning").textContent = d.warning;
     $("s-info").textContent = d.info;
 
     const t = $("errs");
-    t.innerHTML = "";
+    t.textContent = "";
     if (!d.top_errors.length) {
-      t.innerHTML = "<tr><td class='muted'>Nu au fost gasite erori.</td></tr>";
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.className = "muted";
+      td.textContent = "Nu au fost găsite erori.";
+      tr.append(td);
+      t.append(tr);
     }
     d.top_errors.forEach(e => {
       const tr = document.createElement("tr");
       const a = document.createElement("td"); a.className = "n"; a.textContent = e.count + "x";
       const b = document.createElement("td"); b.textContent = e.message;
-      tr.append(a, b); t.append(tr);
+      tr.append(a, b);
+      t.append(tr);
     });
 
-    aiContent.innerHTML = "";
     if (d.ai) {
       $("ai-model").textContent = "(" + d.model + ")";
-      const aiData = d.ai;
-
-      if (aiData.confidence) {
-        aiBadge.textContent = "Certitudine: " + aiData.confidence;
-        aiBadge.classList.remove("hidden");
-        const confClass = aiData.confidence.toLowerCase() === "high" ? "badge-high" 
-                        : aiData.confidence.toLowerCase() === "low" ? "badge-low" 
-                        : "badge-medium";
-        aiBadge.classList.add(confClass);
-      }
-
-      const box = document.createElement("div");
-      box.className = "ai-box";
-
-      if (aiData.main_issue) {
-        const issue = document.createElement("div");
-        issue.innerHTML = `<strong>Problema identificată:</strong> <p style="margin:4px 0 0;">${aiData.main_issue}</p>`;
-        box.appendChild(issue);
-      }
-
-      if (aiData.possible_causes && aiData.possible_causes.length) {
-        const causesDiv = document.createElement("div");
-        causesDiv.className = "ai-section";
-        causesDiv.innerHTML = `<h3>Cauze posibile</h3>`;
-        const ul = document.createElement("ul");
-        ul.className = "ai-list";
-        aiData.possible_causes.forEach(cause => {
-          const li = document.createElement("li");
-          li.textContent = cause;
-          ul.appendChild(li);
-        });
-        causesDiv.appendChild(ul);
-        box.appendChild(causesDiv);
-      }
-
-      if (aiData.investigation_steps && aiData.investigation_steps.length) {
-        const stepsDiv = document.createElement("div");
-        stepsDiv.className = "ai-section";
-        stepsDiv.innerHTML = `<h3>Ce ar trebui verificat</h3>`;
-        const ul = document.createElement("ul");
-        ul.className = "steps-list";
-        aiData.investigation_steps.forEach((step, idx) => {
-          const li = document.createElement("li");
-          li.innerHTML = `<strong>${idx + 1}.</strong> ${step}`;
-          ul.appendChild(li);
-        });
-        stepsDiv.appendChild(ul);
-        box.appendChild(stepsDiv);
-      }
-
-      aiContent.appendChild(box);
+      if (d.ai.confidence) showBadge(d.ai.confidence);
+      showAnalysis(d.ai);
+      showAgentInfo(d.attempts, d.context_lines);
     } else {
-      aiContent.innerHTML = `<span class="error">${d.ai_error}</span>`;
+      showMessage(d.ai_error, "error");
     }
   } catch (err) {
-    aiContent.innerHTML = `<span class="error">Eroare: ${err}</span>`;
+    showMessage("Eroare: " + err.message, "error");
   }
   $("go").disabled = false;
 });
@@ -336,6 +496,7 @@ $("go").addEventListener("click", async () => {
 </body>
 </html>
 """
+
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, content_type):
@@ -373,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}"
-    print(f"Interfata ruleaza la {url}  (Ctrl+C pentru oprire)")
+    print(f"Interfața rulează la {url}  (Ctrl+C pentru oprire)")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
