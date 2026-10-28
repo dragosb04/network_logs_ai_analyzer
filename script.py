@@ -5,10 +5,14 @@ import threading
 import webbrowser
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Literal
 
-import requests
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
+from ollama import ResponseError
+from pydantic import BaseModel
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "deepseek-r1:1.5b")
 HOST = "127.0.0.1"
 PORT = 8765
@@ -51,75 +55,49 @@ def build_ai_input(level_counts, error_messages):
         parts.append(f"{count}x {message}")
     return mask_sensitive("\n".join(parts))
 
-AI_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "main_issue": {"type": "string"},
-        "confidence": {"type": "string", "enum": ["High", "Medium", "Low"]},
-        "possible_causes": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "investigation_steps": {
-            "type": "array",
-            "items": {"type": "string"}
-        }
-    },
-    "required": ["main_issue", "confidence", "possible_causes", "investigation_steps"]
-}
+class LogAnalysis(BaseModel):
+    main_issue: str
+    confidence: Literal["High", "Medium", "Low"]
+    possible_causes: list[str]
+    investigation_steps: list[str]
 
-def clean_json_response(raw_text):
-    """Curata eventualele marcaje de cod Markdown daca modelul le include."""
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an expert system and network support engineer. Analyze this log summary carefully.\n"
+     "Identify the core root cause, evaluate confidence, list likely causes, and actionable checks."),
+    ("human", "LOG SUMMARY:\n{summary}"),
+])
 
-def ask_ai(summary_text, model, max_retries=2):
-    prompt = (
-        "You are an expert system and network support engineer. Analyze this log summary carefully.\n"
-        "Identify the core root cause, evaluate confidence, list likely causes, and actionable checks.\n\n"
-        f"LOG SUMMARY:\n{summary_text}"
+def build_chain(model_name):
+    model = ChatOllama(
+        model=model_name,
+        base_url=OLLAMA_BASE_URL,
+        temperature=0.1,
+        seed=42,
+        num_predict=1024,
+    )
+    structured_model = model.with_structured_output(LogAnalysis)
+    return prompt | structured_model
+
+def remove_numbering(text):
+    return re.sub(r"^\s*\d+[.)]\s*", "", text)
+
+def ask_ai(summary_text, model_name, max_retries=2):
+    chain = build_chain(model_name)
+    chain_with_retry = chain.with_retry(
+        retry_if_exception_type=(ValueError,),
+        stop_after_attempt=max_retries,
     )
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "format": AI_RESPONSE_SCHEMA,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "num_predict": 1024
-        }
-    }
+    result = chain_with_retry.invoke({"summary": summary_text})
+    data = result.model_dump()
 
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(OLLAMA_URL, json=payload, timeout=180)
-            response.raise_for_status()
+    clean_steps = []
+    for step in data["investigation_steps"]:
+        clean_steps.append(remove_numbering(step))
+    data["investigation_steps"] = clean_steps
 
-            raw_resp = response.json().get("response", "").strip()
-            if not raw_resp:
-                raise ValueError("Ollama a returnat un raspuns gol.")
-
-            cleaned = clean_json_response(raw_resp)
-            data = json.loads(cleaned)
-
-            return {
-                "main_issue": data.get("main_issue") or "Problema nedetectata clar.",
-                "confidence": data.get("confidence") or "Medium",
-                "possible_causes": data.get("possible_causes") or [],
-                "investigation_steps": data.get("investigation_steps") or []
-            }
-
-        except (json.JSONDecodeError, ValueError) as err:
-            last_error = err
-            continue
-
-    raise ValueError(f"Nu s-a putut genera un raspuns structurat valid: {last_error}")
+    return data
 
 
 def analyze(text, model):
@@ -141,13 +119,13 @@ def analyze(text, model):
 
     try:
         result["ai"] = ask_ai(build_ai_input(level_counts, error_messages), model)
-    except requests.exceptions.ConnectionError:
+    except ConnectionError:
         result["ai_error"] = "Nu ma pot conecta la Ollama. Ruleaza? (incearca: ollama serve)"
-    except requests.exceptions.HTTPError:
+    except ResponseError:
         result["ai_error"] = f"Ollama a returnat o eroare. Modelul e descarcat? (incearca: ollama pull {model})"
-    except json.JSONDecodeError:
+    except ValueError:
         result["ai_error"] = "Modelul nu a returnat un raspuns JSON valid."
-    except requests.exceptions.RequestException as error:
+    except Exception as error:
         result["ai_error"] = f"Analiza AI a esuat: {error}"
 
     return result
