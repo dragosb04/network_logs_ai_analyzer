@@ -110,6 +110,25 @@ Settings at the top of `log_ai_reviewer.py`:
 | Ollama a returnat o eroare | The model is not downloaded: `ollama pull <model>` |
 | Modelul nu a returnat un răspuns JSON valid | Try again or use a larger model (e.g. `qwen2.5:3b` or `qwen2.5:7b`) |
 
+## Test data
+
+No logs of your own? `generate_data.py` creates a sample log you can use to try the tool:
+
+```bash
+python3 generate_data.py
+```
+
+On Windows, use `python` instead of `python3`.
+
+It writes `datasets.log` (2,000 lines) in the current folder. Running it again overwrites the file.
+
+The generated log contains:
+- `INFO`, `WARNING` and `ERROR` entries in the supported format, a few seconds apart
+- common problems such as refused connections, DNS failures, a full disk, timeouts and an exhausted database pool
+- fake IP addresses, emails and passwords, so you can check that masking works before anything reaches the model
+
+Entries are picked at random, so every run produces a slightly different log. All data is fictional.
+
 ## Supported log format
 
 The tool currently expects one entry per line with an uppercase level keyword:
